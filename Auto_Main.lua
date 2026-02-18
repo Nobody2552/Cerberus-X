@@ -1,132 +1,64 @@
 --[[ 
-    Project Dark - Auto_Main.lua (Executor Edition)
+    Project Dark - Auto_Main.lua (Xeno / Executor Edition)
     
     Uses executor-native HTTP (request/syn.request/http_request)
     instead of HttpService:PostAsync/GetAsync which are BLOCKED.
+    Xeno: game:HttpGet is unblocked natively and used for Rayfield.
     
     Features:
     - HMAC-signed token auth via /api/script/validate
-    - Remote server joining / teleport
-    - Dashboard integration (heartbeat, config, commands, logs)
-    - Anti-AFK, auto-respawn, tween-to-target
+    - Remote config push/poll with dual userId + username lookup
+    - Instant config via updateConfig command with inline data
+    - Remote server joining / teleport commands
+    - Auto re-execute after server hop (queue_on_teleport)
+    - Auto-reconnect with carried auth token on hop
+    - Anti-AFK, auto-respawn, randomized tween-to-target (3-8s)
+    - Teleport failure retry
     - Full error diagnostics in Rayfield UI
 ]]--
 
 wait(0.5)
 
 -- ============ EXECUTOR HTTP COMPATIBILITY ============
--- Different executors provide HTTP in different ways:
---   Synapse X:      syn.request(...)
---   KRNL/Fluxus:    request(...) or http_request(...)
---   Xeno:           99% UNC -- provides request() global AND unblocks HttpService:RequestAsync
---   Studio:         Native HttpService works directly
---
--- We build a unified httpRequest(params) that tries EVERY method on each call,
--- so there is no fragile upfront detection that can silently fail.
+-- Roblox blocks HttpService:PostAsync/GetAsync/UrlEncode in executors.
+-- All modern executors provide one of these global functions instead.
+local httpRequest = (syn and syn.request) 
+    or (http and http.request) 
+    or (fluxus and fluxus.request)
+    or request 
+    or http_request
 
-local _HttpService = game:GetService("HttpService")
-
--- Collect all possible request functions (pcall each to avoid "not defined" errors)
-local _methods = {}
-pcall(function() if syn and syn.request then table.insert(_methods, syn.request) end end)
-pcall(function() if http and http.request then table.insert(_methods, http.request) end end)
-pcall(function() if fluxus and fluxus.request then table.insert(_methods, fluxus.request) end end)
-pcall(function() if request then table.insert(_methods, request) end end)
-pcall(function() if http_request then table.insert(_methods, http_request) end end)
-
--- Also add HttpService:RequestAsync as a method (Xeno unblocks this)
-table.insert(_methods, function(params)
-    return _HttpService:RequestAsync({
-        Url = params.Url,
-        Method = params.Method or "GET",
-        Headers = params.Headers or {},
-        Body = params.Body,
-    })
-end)
-
--- Also add GetAsync/PostAsync wrappers as last resort
-table.insert(_methods, function(params)
-    local method = params.Method or "GET"
-    if method == "POST" then
-        local result = _HttpService:PostAsync(params.Url, params.Body or "", Enum.HttpContentType.ApplicationJson, false)
-        return { StatusCode = 200, Body = result, Success = true }
-    else
-        local result = _HttpService:GetAsync(params.Url)
-        return { StatusCode = 200, Body = result, Success = true }
-    end
-end)
-
--- Also add game:HttpGet wrapper
-table.insert(_methods, function(params)
-    if (params.Method or "GET") == "GET" then
-        local result = game:HttpGet(params.Url)
-        return { StatusCode = 200, Body = result, Success = true }
-    end
-    -- game:HttpGet can't POST, fall through
-    error("game:HttpGet does not support POST")
-end)
-
--- Unified request function: tries each method until one succeeds
-local function httpRequest(params)
-    local lastErr = "No HTTP methods available"
-    for _, fn in ipairs(_methods) do
-        local ok, resp = pcall(fn, params)
-        if ok and resp then
-            -- Normalize response: some return { Body = ... }, some { body = ... }
-            if type(resp) == "string" then
-                return { StatusCode = 200, Body = resp, Success = true }
-            end
-            if type(resp) == "table" then
-                resp.Body = resp.Body or resp.body or ""
-                resp.StatusCode = resp.StatusCode or resp.StatusCode or 200
-                resp.Success = (resp.Success ~= false)
-                return resp
-            end
+if not httpRequest then
+    -- Last-resort fallback: try to wrap HttpService (will fail in most executors)
+    local HttpService = game:GetService("HttpService")
+    httpRequest = function(params)
+        local method = params.Method or "GET"
+        local url = params.Url
+        local body = params.Body
+        local headers = params.Headers or {}
+        
+        local success, result
+        if method == "POST" then
+            success, result = pcall(function()
+                return HttpService:PostAsync(url, body, Enum.HttpContentType.ApplicationJson, false, headers)
+            end)
         else
-            lastErr = tostring(resp)
+            success, result = pcall(function()
+                return HttpService:GetAsync(url, true, headers)
+            end)
+        end
+        
+        if success then
+            return { StatusCode = 200, Body = result, Success = true }
+        else
+            return { StatusCode = 0, Body = tostring(result), Success = false }
         end
     end
-    return { StatusCode = 0, Body = lastErr, Success = false }
 end
 
 -- ============ UI SETUP ============
--- Rayfield fetch: httpRequest already tries every HTTP method (executor globals,
--- RequestAsync, GetAsync, game:HttpGet) so we just need to try each URL.
-
-local _rayfieldSource = nil
-
-local function _isLuaSource(src)
-    if type(src) ~= "string" then return false end
-    if #src < 200 then return false end
-    if src:sub(1, 1) == "<" then return false end
-    if src:find("<!DOCTYPE", 1, true) then return false end
-    return true
-end
-
-local _rayfieldUrls = {
-    "https://sirius.menu/rayfield",
-    "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
-    "https://raw.githubusercontent.com/shlexware/Rayfield/main/source",
-}
-
-for _, url in ipairs(_rayfieldUrls) do
-    if _rayfieldSource then break end
-    pcall(function()
-        local resp = httpRequest({ Url = url, Method = "GET" })
-        local body = (type(resp) == "table") and (resp.Body or resp.body) or (type(resp) == "string" and resp) or nil
-        if _isLuaSource(body) then
-            _rayfieldSource = body
-        end
-    end)
-end
-
-if not _rayfieldSource then
-    local exName = "Unknown"
-    pcall(function() exName = identifyexecutor and identifyexecutor() or (getexecutorname and getexecutorname()) or "Unknown" end)
-    error("[Project Dark] Could not fetch Rayfield. Executor: " .. tostring(exName) .. ". Ensure HTTP is enabled.")
-end
-
-local Rayfield = loadstring(_rayfieldSource)()
+-- game:HttpGet works natively in Xeno and most executors
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 local Window = Rayfield:CreateWindow({
     Name = "Project Dark",
     Icon = 0,
@@ -158,21 +90,8 @@ pcall(function()
         and ReplicatedStorage.Remotes.Duels:FindFirstChild("RespawnNow")
 end)
 
--- ============ AUTO RE-EXECUTE ON SERVER HOP ============
--- Executors provide queue_on_teleport which queues a script to run after teleport.
--- Each executor may expose it differently, so we pcall each check.
-local _queueOnTeleport = nil
-pcall(function() if syn and syn.queue_on_teleport then _queueOnTeleport = syn.queue_on_teleport end end)
-if not _queueOnTeleport then pcall(function() if queue_on_teleport then _queueOnTeleport = queue_on_teleport end end) end
-if not _queueOnTeleport then pcall(function() if fluxus and fluxus.queue_on_teleport then _queueOnTeleport = fluxus.queue_on_teleport end end) end
-
--- IMPORTANT: Replace this URL with your actual raw GitHub script URL
-local SCRIPT_REEXEC_URL = "https://raw.githubusercontent.com/Nobody2552/Project-Dark/main/Auto_Main.lua"
--- If you set _G.__ProjectDark_ScriptURL before loading, it will override the fallback
-local SELF_URL = _G.__ProjectDark_ScriptURL or nil
-
 -- ============ STATE ============
--- Restore state from previous server hop if available (set by queue_on_teleport)
+-- Restore state from a previous server hop if _G flags were set by queue_on_teleport
 local authToken = _G.__ProjectDark_AuthToken or ""
 local authenticated = false
 _G.TargetUsername = _G.__ProjectDark_Target or ""
@@ -186,106 +105,12 @@ local deathCount = 0
 local killsPerRound = _G.__ProjectDark_KillsPerRound or 15
 local isServerHop = (_G.__ProjectDark_AuthToken ~= nil and _G.__ProjectDark_AuthToken ~= "")
 
--- Clean up _G flags so they don't persist beyond this load
+-- Clean up _G hop flags so they don't persist
 _G.__ProjectDark_AuthToken = nil
 _G.__ProjectDark_Target = nil
 _G.__ProjectDark_Distance = nil
 _G.__ProjectDark_Enabled = nil
 _G.__ProjectDark_KillsPerRound = nil
-
--- ============ AUTO-REEXECUTE FUNCTION ============
--- Build and queue the re‑execution script (preserves token and settings)
-local function queueAutoReexecute()
-    if not _queueOnTeleport then 
-        warn("⚠️ queue_on_teleport not available – auto‑re‑execution disabled")
-        return false 
-    end
-    
-    -- Use SELF_URL if available, otherwise fallback to SCRIPT_REEXEC_URL
-    local scriptUrl = SELF_URL or SCRIPT_REEXEC_URL
-    
-    -- Build the re-exec script that sets globals before loading the main script.
-    -- IMPORTANT: The queued script runs in a fresh executor context on the new server,
-    -- so it must also use executor HTTP (not game:HttpGet which is blocked).
-    local reexecScript = string.format([[
-        -- Project Dark: Auto re-execute after server hop
-        _G.__ProjectDark_AuthToken = %q
-        _G.__ProjectDark_Target = %q
-        _G.__ProjectDark_Distance = %s
-        _G.__ProjectDark_Enabled = %s
-        _G.__ProjectDark_KillsPerRound = %s
-        _G.__ProjectDark_ScriptURL = %q
-        task.wait(2)
-
-        -- Fetch script source using every available HTTP method
-        local __src = nil
-        local __url = %q
-        local function __ok(s) return type(s)=="string" and #s>200 and s:sub(1,1)~="<" end
-        local function __body(r)
-            if type(r)=="string" then return r end
-            if type(r)=="table" then return r.Body or r.body end
-            return nil
-        end
-        -- 1. Executor globals (Synapse, KRNL, Fluxus, Script-Ware)
-        local __req=nil
-        pcall(function() if syn and syn.request then __req=syn.request end end)
-        if not __req then pcall(function() if request then __req=request end end) end
-        if not __req then pcall(function() if http_request then __req=http_request end end) end
-        if __req then pcall(function()
-            local r=__req({Url=__url,Method="GET"})
-            local b=__body(r)
-            if __ok(b) then __src=b end
-        end) end
-        -- 2. HttpService:RequestAsync (Xeno)
-        if not __src then pcall(function()
-            local hs=game:GetService("HttpService")
-            local r=hs:RequestAsync({Url=__url,Method="GET"})
-            local b=__body(r)
-            if __ok(b) then __src=b end
-        end) end
-        -- 3. game:HttpGet (Xeno also unblocks this)
-        if not __src then pcall(function()
-            local b=game:HttpGet(__url)
-            if __ok(b) then __src=b end
-        end) end
-        -- 4. httpget global
-        if not __src then pcall(function()
-            local b=(httpget or http_get)(__url)
-            if __ok(b) then __src=b end
-        end) end
-        if __src then
-            loadstring(__src)()
-        else
-            warn("[Project Dark] Failed to re-fetch script after server hop. URL: " .. __url)
-        end
-    ]],
-        authToken or "",
-        tostring(_G.TargetUsername or ""),
-        tostring(_G.Distance or 0),
-        tostring(enabled),
-        tostring(killsPerRound),
-        scriptUrl,
-        scriptUrl
-    )
-    
-    local success, err = pcall(function()
-        _queueOnTeleport(reexecScript)
-    end)
-    if success then
-        return true
-    else
-        warn("Failed to queue teleport script:", err)
-        return false
-    end
-end
-
--- Queue immediately on script load (after state is defined) so it's ready for the first teleport
-queueAutoReexecute()
-
--- Re-queue whenever state changes (so the re‑exec payload has latest config)
-local function refreshTeleportQueue()
-    pcall(queueAutoReexecute)
-end
 
 -- ============ DASHBOARD ENDPOINTS ============
 -- IMPORTANT: Change this URL to your deployed dashboard URL
@@ -337,7 +162,6 @@ local function urlEncode(str)
 end
 
 -- ============ HTTP LAYER (executor-native) ============
--- POST JSON to a URL, returns (success: bool, decoded: table|string)
 local function postJSON(url, data)
     data.authToken = authToken  -- always inject the token
     
@@ -357,40 +181,26 @@ local function postJSON(url, data)
         })
     end)
     
-    if not ok then
-        return false, "HTTP error: " .. tostring(response)
-    end
+    if not ok then return false, "HTTP error: " .. tostring(response) end
+    if not response then return false, "No response from server" end
     
-    if not response then
-        return false, "No response from server"
-    end
-    
-    -- Executor request() returns { StatusCode, Body, Success, Headers }
     local statusCode = response.StatusCode or 0
     local body = response.Body or ""
     
-    -- Try to decode JSON response
     local decodeOk, decoded = pcall(function()
         return HttpService:JSONDecode(body)
     end)
     
     if statusCode >= 200 and statusCode < 300 then
-        if decodeOk then
-            return true, decoded
-        end
+        if decodeOk then return true, decoded end
         return true, body
     end
     
-    -- Error response
-    if decodeOk and decoded then
-        return false, decoded
-    end
+    if decodeOk and decoded then return false, decoded end
     return false, "HTTP " .. tostring(statusCode) .. ": " .. body:sub(1, 200)
 end
 
--- GET JSON from a URL, returns (success: bool, decoded: table|string)
 local function getJSON(url)
-    -- Append authToken as query parameter
     local separator = url:find("?") and "&" or "?"
     local finalUrl = url .. separator .. "authToken=" .. urlEncode(authToken)
     
@@ -406,13 +216,8 @@ local function getJSON(url)
         })
     end)
     
-    if not ok then
-        return false, "HTTP error: " .. tostring(response)
-    end
-    
-    if not response then
-        return false, "No response from server"
-    end
+    if not ok then return false, "HTTP error: " .. tostring(response) end
+    if not response then return false, "No response from server" end
     
     local statusCode = response.StatusCode or 0
     local body = response.Body or ""
@@ -422,21 +227,16 @@ local function getJSON(url)
     end)
     
     if statusCode >= 200 and statusCode < 300 then
-        if decodeOk then
-            return true, decoded
-        end
+        if decodeOk then return true, decoded end
         return true, body
     end
     
-    if decodeOk and decoded then
-        return false, decoded
-    end
+    if decodeOk and decoded then return false, decoded end
     return false, "HTTP " .. tostring(statusCode) .. ": " .. body:sub(1, 200)
 end
 
 -- ============ LOG HELPER ============
 local function sendLog(level, message)
-    -- Fire and forget -- don't block on logging
     task.spawn(function()
         pcall(function()
             postJSON(ENDPOINTS.log, {
@@ -462,7 +262,7 @@ local function sendHeartbeat()
         player = playerName,
         userId = userId,
         timestamp = os.time(),
-        serverIp = jobId, -- use jobId as identifier
+        serverIp = jobId,
         serverPort = 0,
         kills = killCount,
         deaths = deathCount,
@@ -478,16 +278,13 @@ local function validateToken(token)
     if cleanedToken == "" then
         return false, { error = "Empty token after cleaning" }
     end
-    
     if not cleanedToken:match("^PD%-") then
         return false, { error = "Token must start with PD- (got: " .. cleanedToken:sub(1, 10) .. ")" }
     end
-    
     if not cleanedToken:find("%.") then
-        return false, { error = "Token missing HMAC signature (no dot). Copy the FULL token from the dashboard." }
+        return false, { error = "Token missing HMAC signature (no dot). Copy the FULL token." }
     end
     
-    -- Temporarily set authToken so postJSON includes it
     local previousToken = authToken
     authToken = cleanedToken
     
@@ -500,18 +297,14 @@ local function validateToken(token)
     })
     
     if ok and type(response) == "table" and response.valid == true then
-        -- Keep the cleaned token (already set above)
         return true, response
     end
     
-    -- Validation failed -- restore previous token
     authToken = previousToken
     
     local errMsg = "Server rejected token"
     if type(response) == "table" then
-        if response.error then
-            errMsg = response.error
-        end
+        if response.error then errMsg = response.error end
         if response.debug then
             errMsg = errMsg .. " [len=" .. tostring(response.debug.tokenLength or "?")
             errMsg = errMsg .. " hmac=" .. tostring(response.debug.hmacCheck)
@@ -524,20 +317,63 @@ local function validateToken(token)
     return false, { error = errMsg }
 end
 
+-- ============ AUTO RE-EXECUTE ON SERVER HOP ============
+-- queue_on_teleport queues a script string to run after teleport completes.
+local _queueOnTeleport = nil
+pcall(function() if syn and syn.queue_on_teleport then _queueOnTeleport = syn.queue_on_teleport end end)
+if not _queueOnTeleport then pcall(function() if queue_on_teleport then _queueOnTeleport = queue_on_teleport end end) end
+if not _queueOnTeleport then pcall(function() if fluxus and fluxus.queue_on_teleport then _queueOnTeleport = fluxus.queue_on_teleport end end) end
+
+local SELF_URL = _G.__ProjectDark_ScriptURL or nil
+
+local function queueAutoReexecute()
+    if not _queueOnTeleport then return false end
+    
+    local scriptUrl = SELF_URL or (BASE_URL .. "/scripts/Auto_Main.lua")
+    
+    -- The queued script uses game:HttpGet which works in Xeno and most executors.
+    -- It sets _G flags to carry state, then loads the main script fresh.
+    local reexecScript = string.format([[
+        _G.__ProjectDark_AuthToken = %q
+        _G.__ProjectDark_Target = %q
+        _G.__ProjectDark_Distance = %s
+        _G.__ProjectDark_Enabled = %s
+        _G.__ProjectDark_KillsPerRound = %s
+        _G.__ProjectDark_ScriptURL = %q
+        task.wait(2)
+        loadstring(game:HttpGet(%q))()
+    ]],
+        authToken or "",
+        tostring(_G.TargetUsername or ""),
+        tostring(_G.Distance or 0),
+        tostring(enabled),
+        tostring(killsPerRound),
+        scriptUrl,
+        scriptUrl
+    )
+    
+    pcall(function() _queueOnTeleport(reexecScript) end)
+    return true
+end
+
+-- Queue on first load so it's ready for the first teleport
+queueAutoReexecute()
+
+local function refreshTeleportQueue()
+    pcall(queueAutoReexecute)
+end
+
 -- ============ FORWARD DECLARATIONS ============
 local applyConfig
 local fetchAndApplyConfig
 
 -- ============ UI TABS AND ELEMENTS ============
 local MainTab = Window:CreateTab("Main", nil)
-local DebugTab = Window:CreateTab("Debug", nil)  -- New debug tab
 
--- Status section (created first so auth callback can reference them)
 MainTab:CreateSection("Status")
 local StatusLabel = MainTab:CreateLabel("Waiting for authentication...")
 local StatsLabel = MainTab:CreateLabel("Kills: 0 | Deaths: 0")
 
--- Auth section
 MainTab:CreateSection("Authentication")
 local AuthStatus = MainTab:CreateLabel("Paste your token (PD-xxx.xxx) from the dashboard")
 
@@ -566,7 +402,7 @@ local AuthInput = MainTab:CreateInput({
                     Content = "Connected to Project Dark dashboard.",
                     Duration = 4,
                 })
-                -- Queue auto-reexec with the new valid token for server hops
+                -- Queue reexec with fresh token
                 refreshTeleportQueue()
                 -- First heartbeat + initial config fetch
                 sendHeartbeat()
@@ -595,7 +431,6 @@ local AuthInput = MainTab:CreateInput({
     end,
 })
 
--- Controls section
 MainTab:CreateSection("Controls")
 
 local EnabledToggle = MainTab:CreateToggle({
@@ -607,7 +442,7 @@ local EnabledToggle = MainTab:CreateToggle({
         StatusLabel:Set("Enabled: " .. tostring(v) .. " | Target: " .. tostring(_G.TargetUsername))
         if authenticated then
             sendLog("info", "Toggle: " .. tostring(v))
-            refreshTeleportQueue()   -- re‑queue with new state
+            refreshTeleportQueue()
         end
     end,
 })
@@ -639,13 +474,10 @@ local DistanceSlider = MainTab:CreateSlider({
     Callback = function(v)
         _G.Distance = v
         StatusLabel:Set("Distance: " .. v)
-        if authenticated then
-            refreshTeleportQueue()
-        end
+        if authenticated then refreshTeleportQueue() end
     end,
 })
 
--- Info section
 MainTab:CreateSection("Info")
 
 MainTab:CreateButton({
@@ -673,29 +505,7 @@ MainTab:CreateButton({
     end,
 })
 
--- Debug tab
-DebugTab:CreateSection("Teleport Debug")
-local TeleportStatus = DebugTab:CreateLabel("queue_on_teleport: " .. tostring(_queueOnTeleport ~= nil))
-
-DebugTab:CreateButton({
-    Name = "Re‑queue Teleport Script",
-    Callback = function()
-        local ok = queueAutoReexecute()
-        if ok then
-            Rayfield:Notify({ Title = "Queued", Content = "Auto‑exec script queued for next teleport.", Duration = 3 })
-        else
-            Rayfield:Notify({ Title = "Failed", Content = "queue_on_teleport not available.", Duration = 5 })
-        end
-    end,
-})
-
-DebugTab:CreateSection("Script URL")
-local UrlStatus = DebugTab:CreateLabel("Using: " .. (SELF_URL or SCRIPT_REEXEC_URL))
-if not SELF_URL and SCRIPT_REEXEC_URL:find("YOUR_USER") then
-    UrlStatus:Set("⚠️ WARNING: Script URL is still the placeholder! Replace it.")
-end
-
-DebugTab:CreateButton({
+MainTab:CreateButton({
     Name = "Test HTTP Connection",
     Callback = function()
         Rayfield:Notify({ Title = "Testing...", Content = "Sending test request to server...", Duration = 2 })
@@ -731,7 +541,6 @@ DebugTab:CreateButton({
 })
 
 -- ============ TELEPORT FAILURE RETRY ============
--- If a teleport fails (server full, network error, etc.), automatically retry
 TeleportService.TeleportInitFailed:Connect(function(player, result, errorMessage)
     if player ~= LocalPlayer then return end
     sendLog("warn", "Teleport failed: " .. tostring(result) .. " - " .. tostring(errorMessage))
@@ -741,7 +550,6 @@ TeleportService.TeleportInitFailed:Connect(function(player, result, errorMessage
         Duration = 5,
     })
     task.wait(5)
-    -- Retry: re-queue and attempt again
     refreshTeleportQueue()
     pcall(function()
         TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer)
@@ -775,13 +583,10 @@ end
 LocalPlayer.CharacterAdded:Connect(setupRespawn)
 if LocalPlayer.Character then setupRespawn(LocalPlayer.Character) end
 
--- ============ TWEEN TO TARGET ============
--- Randomized tween duration between 3-8 seconds per movement
--- Uses math.random seeded with tick() for better entropy
+-- ============ TWEEN TO TARGET (Randomized 3-8s) ============
 math.randomseed(tick() * 1000 + LocalPlayer.UserId)
 
 local function randomTweenDuration()
-    -- Returns a float between 3.0 and 8.0 (e.g. 4.72, 6.13, etc.)
     return 3.0 + (math.random() * 5.0)
 end
 
@@ -817,7 +622,6 @@ task.spawn(function()
     while true do
         if enabled and authenticated then
             pcall(tweenToTarget)
-            -- Small buffer after tween completes before starting the next one
             task.wait(0.3 + math.random() * 0.4)
         else
             task.wait(1)
@@ -831,7 +635,6 @@ applyConfig = function(data)
     if not data or type(data) ~= "table" then return false end
     if not data.hasRemoteConfig then return false end
     
-    -- Build a simple hash to avoid re-applying identical config
     local hash = tostring(data.enabled) .. "|" .. tostring(data.target) .. "|" .. tostring(data.distance) .. "|" .. tostring(data.killsPerRound)
     if hash == lastConfigHash then return false end
     lastConfigHash = hash
@@ -858,12 +661,13 @@ applyConfig = function(data)
         Content = "Target: " .. tostring(data.target) .. " | Distance: " .. tostring(data.distance) .. " | KPR: " .. tostring(data.killsPerRound),
         Duration = 4,
     })
+    refreshTeleportQueue()
     return true
 end
 
 -- ============ FETCH CONFIG FROM SERVER ============
 fetchAndApplyConfig = function()
-    -- Try with numeric userId first (this is what the dashboard stores under)
+    -- Try with numeric userId first (dashboard stores config under robloxUserId)
     local ok, data = getJSON(ENDPOINTS.config .. "?userId=" .. urlEncode(userId))
     if ok and type(data) == "table" and data.hasRemoteConfig then
         applyConfig(data)
@@ -893,7 +697,7 @@ task.spawn(function()
     while true do
         task.wait(10)
         if authenticated then
-            -- Poll commands with both userId (numeric) and playerName
+            -- Poll commands with numeric userId first
             local ok, data = getJSON(ENDPOINTS.commands .. "?userId=" .. urlEncode(userId))
             
             -- If no command found under numeric userId, try by username
@@ -908,16 +712,15 @@ task.spawn(function()
                 if cmd == "joinServer" and data.placeId and data.jobId then
                     sendLog("info", "Joining server: " .. tostring(data.placeId) .. "/" .. tostring(data.jobId))
                     Rayfield:Notify({ Title = "Teleporting", Content = "Joining server...", Duration = 5 })
-                    refreshTeleportQueue() -- ensure auto-reexec is queued with latest state
+                    refreshTeleportQueue()
                     pcall(function()
                         TeleportService:TeleportToPlaceInstance(tonumber(data.placeId), data.jobId, LocalPlayer)
                     end)
                     
                 elseif cmd == "updateConfig" then
-                    -- First try to apply inline data from the command itself
+                    -- Apply inline data from command (instant, no extra fetch needed)
                     local inlineData = data.data
                     if inlineData and type(inlineData) == "table" then
-                        -- The dashboard sends the config values directly in the command data
                         local configPayload = {
                             hasRemoteConfig = true,
                             enabled = inlineData.enabled,
@@ -927,7 +730,7 @@ task.spawn(function()
                         }
                         applyConfig(configPayload)
                     end
-                    -- Also fetch from config endpoint as backup/confirmation
+                    -- Also fetch from config endpoint as backup confirmation
                     task.spawn(fetchAndApplyConfig)
                     
                 elseif cmd == "disconnect" then
@@ -950,10 +753,10 @@ task.spawn(function()
     end
 end)
 
--- ============ HEARTBEAT LOOP (randomized ~22s) ============
+-- ============ HEARTBEAT LOOP (~22s) ============
 task.spawn(function()
     while true do
-        task.wait(22 + math.random(-3, 3))  -- slight randomization
+        task.wait(22)
         if authenticated then
             sendHeartbeat()
         end
@@ -965,7 +768,7 @@ pcall(function() Rayfield:LoadConfiguration() end)
 StatsLabel:Set("Kills: " .. killCount .. " | Deaths: " .. deathCount)
 
 if isServerHop and authToken ~= "" then
-    -- AUTO-AUTHENTICATE: We arrived from a server hop with a saved token
+    -- AUTO-AUTHENTICATE after server hop with carried token
     StatusLabel:Set("Server hop detected -- auto-authenticating...")
     AuthStatus:Set("Re-validating token from previous server...")
     Rayfield:Notify({
@@ -982,15 +785,13 @@ if isServerHop and authToken ~= "" then
             AuthStatus:Set("RECONNECTED via " .. method .. " | Hop successful")
             sendLog("success", playerName .. " auto-reconnected after server hop (place " .. placeId .. ")")
             sendHeartbeat()
-            -- Refresh the teleport queue with current state for the next hop
             refreshTeleportQueue()
-            -- Apply any config updates
             task.spawn(function()
                 task.wait(1)
                 pcall(fetchAndApplyConfig)
             end)
             StatusLabel:Set("ONLINE (hop) | Target: " .. tostring(_G.TargetUsername) .. " | Dist: " .. tostring(_G.Distance))
-            -- Restore UI elements to match carried state
+            -- Restore UI to match carried state
             pcall(function() EnabledToggle:Set(enabled) end)
             if _G.TargetUsername ~= "" then
                 pcall(function() TargetInput:Set(_G.TargetUsername) end)
@@ -1002,7 +803,7 @@ if isServerHop and authToken ~= "" then
                 Duration = 4,
             })
         else
-            -- Auto-auth failed, fall back to manual
+            -- Token expired or invalid, fall back to manual auth
             authToken = ""
             authenticated = false
             AuthStatus:Set("Auto-reconnect failed. Paste token manually.")
