@@ -52,7 +52,33 @@ if not httpRequest then
 end
 
 -- ============ UI SETUP ============
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+-- game:HttpGet is BLOCKED in executors, so use our executor-compatible httpRequest
+local _rayfieldSource
+local _rfOk, _rfErr = pcall(function()
+    -- Try executor HTTP first (works in all modern executors)
+    local resp = httpRequest({
+        Url = "https://sirius.menu/rayfield",
+        Method = "GET",
+    })
+    if resp and resp.Body and #resp.Body > 100 then
+        _rayfieldSource = resp.Body
+    end
+end)
+-- Fallback chain if executor request failed
+if not _rayfieldSource then
+    pcall(function()
+        _rayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
+    end)
+end
+if not _rayfieldSource then
+    pcall(function()
+        _rayfieldSource = game:HttpGet("https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua")
+    end)
+end
+if not _rayfieldSource or type(_rayfieldSource) ~= "string" or #_rayfieldSource < 100 then
+    error("[Project Dark] Failed to fetch Rayfield UI library. Check your executor's HTTP permissions.")
+end
+local Rayfield = loadstring(_rayfieldSource)()
 local Window = Rayfield:CreateWindow({
     Name = "Project Dark",
     Icon = 0,
@@ -130,9 +156,11 @@ local function queueAutoReexecute()
     -- Use SELF_URL if available, otherwise fallback to SCRIPT_REEXEC_URL
     local scriptUrl = SELF_URL or SCRIPT_REEXEC_URL
     
-    -- Build the re‑exec script that sets globals before loading the main script
+    -- Build the re-exec script that sets globals before loading the main script.
+    -- IMPORTANT: The queued script runs in a fresh executor context on the new server,
+    -- so it must also use executor HTTP (not game:HttpGet which is blocked).
     local reexecScript = string.format([[
-        -- Project Dark: Auto re‑execute after server hop
+        -- Project Dark: Auto re-execute after server hop
         _G.__ProjectDark_AuthToken = %q
         _G.__ProjectDark_Target = %q
         _G.__ProjectDark_Distance = %s
@@ -140,15 +168,36 @@ local function queueAutoReexecute()
         _G.__ProjectDark_KillsPerRound = %s
         _G.__ProjectDark_ScriptURL = %q
         task.wait(2)
-        loadstring(game:HttpGet(%q))()
+
+        -- Fetch script source using executor HTTP (game:HttpGet is blocked)
+        local __src = nil
+        local __url = %q
+        local __httpReq = (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request) or request or http_request or nil
+        if __httpReq then
+            local __ok, __resp = pcall(function()
+                return __httpReq({ Url = __url, Method = "GET" })
+            end)
+            if __ok and __resp and __resp.Body and #__resp.Body > 100 then
+                __src = __resp.Body
+            end
+        end
+        -- Fallback to game:HttpGet (works in some executors / studio)
+        if not __src then
+            pcall(function() __src = game:HttpGet(__url) end)
+        end
+        if __src and type(__src) == "string" and #__src > 100 then
+            loadstring(__src)()
+        else
+            warn("[Project Dark] Failed to re-fetch script after server hop")
+        end
     ]],
-        authToken or "",                           -- FIX: default to empty string if nil
+        authToken or "",
         tostring(_G.TargetUsername or ""),
         tostring(_G.Distance or 0),
         tostring(enabled),
         tostring(killsPerRound),
-        scriptUrl,                                  -- store for next hop
-        scriptUrl                                   -- load the script now
+        scriptUrl,
+        scriptUrl
     )
     
     local success, err = pcall(function()
