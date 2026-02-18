@@ -93,7 +93,7 @@ local _queueOnTeleport = (syn and syn.queue_on_teleport)
     or nil
 
 -- IMPORTANT: Replace this URL with your actual raw GitHub script URL
-local SCRIPT_REEXEC_URL = "https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/Auto_Main.lua"
+local SCRIPT_REEXEC_URL = "https://raw.githubusercontent.com/Nobody2552/Project-Dark/main/Auto_Main.lua"
 -- If you set _G.__ProjectDark_ScriptURL before loading, it will override the fallback
 local SELF_URL = _G.__ProjectDark_ScriptURL or nil
 
