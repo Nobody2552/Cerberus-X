@@ -108,6 +108,7 @@ local function queueAutoReexecute()
     local scriptUrl = SELF_URL or SCRIPT_REEXEC_URL
     
     -- Build the re‑exec script that sets globals before loading the main script
+    -- All values are given safe defaults (or "") to avoid nil in string.format
     local reexecScript = string.format([[
         -- Project Dark: Auto re‑execute after server hop
         _G.__ProjectDark_AuthToken = %q
@@ -117,15 +118,20 @@ local function queueAutoReexecute()
         _G.__ProjectDark_KillsPerRound = %s
         _G.__ProjectDark_ScriptURL = %q
         task.wait(2)
-        loadstring(game:HttpGet(%q))()
+        local success, result = pcall(game.HttpGet, game, %q)
+        if success and result then
+            loadstring(result)()
+        else
+            warn("Project Dark: Failed to fetch script after teleport")
+        end
     ]],
-        authToken,
+        authToken or "",                                    -- <-- FIX: default to empty string if nil
         tostring(_G.TargetUsername or ""),
         tostring(_G.Distance or 0),
         tostring(enabled),
-        tostring(killsPerRound),
-        scriptUrl,           -- store for next hop
-        scriptUrl            -- load the script now
+        tostring(killsPerRound or 15),
+        scriptUrl,
+        scriptUrl
     )
     
     local success, err = pcall(function()
@@ -137,14 +143,6 @@ local function queueAutoReexecute()
         warn("Failed to queue teleport script:", err)
         return false
     end
-end
-
--- Queue immediately on script load so it's ready for the first teleport
-queueAutoReexecute()
-
--- Re-queue whenever state changes (so the re‑exec payload has latest config)
-local function refreshTeleportQueue()
-    pcall(queueAutoReexecute)
 end
 
 -- ============ STATE ============
@@ -168,6 +166,14 @@ _G.__ProjectDark_Target = nil
 _G.__ProjectDark_Distance = nil
 _G.__ProjectDark_Enabled = nil
 _G.__ProjectDark_KillsPerRound = nil
+
+-- Queue immediately on script load (after authToken is defined) so it's ready for the first teleport
+queueAutoReexecute()
+
+-- Re-queue whenever state changes (so the re‑exec payload has latest config)
+local function refreshTeleportQueue()
+    pcall(queueAutoReexecute)
+end
 
 -- ============ DASHBOARD ENDPOINTS ============
 -- IMPORTANT: Change this URL to your deployed dashboard URL
