@@ -14,7 +14,7 @@
     - Auto-reconnect with carried auth token on hop
     - Anti-AFK, auto-respawn, randomized tween-to-target (3-8s)
     - Teleport failure retry
-    - Full error diagnostics in Rayfield UI
+    - Full error diagnostics in Rayfield UI (with fallback if Rayfield fails)
 ]]--
 
 wait(0.5)
@@ -56,10 +56,385 @@ if not httpRequest then
     end
 end
 
--- ============ UI SETUP ============
--- game:HttpGet works natively in Xeno and most executors
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
-local Window = Rayfield:CreateWindow({
+-- ============ ROBUST RAYFIELD LOADER WITH FALLBACK UI ============
+local Rayfield = nil
+local Window = nil
+
+-- Fallback UI (simple but fully functional)
+local function createFallbackUI()
+    local FallbackUI = {}
+    local tabs = {}
+    
+    -- Create a ScreenGui
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "ProjectDark_Fallback"
+    gui.Parent = game:GetService("CoreGui")
+    
+    -- Main frame
+    local main = Instance.new("Frame")
+    main.Size = UDim2.new(0, 500, 0, 400)
+    main.Position = UDim2.new(0.5, -250, 0.5, -200)
+    main.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    main.BorderSizePixel = 0
+    main.Parent = gui
+    
+    -- Title bar
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 30)
+    title.BackgroundColor3 = Color3.fromRGB(34, 34, 34)
+    title.BorderSizePixel = 0
+    title.Text = "Project Dark (Fallback Mode)"
+    title.TextColor3 = Color3.fromRGB(240, 240, 240)
+    title.Font = Enum.Font.SourceSansBold
+    title.TextSize = 18
+    title.Parent = main
+    
+    -- Tab buttons frame
+    local tabFrame = Instance.new("Frame")
+    tabFrame.Size = UDim2.new(1, 0, 0, 40)
+    tabFrame.Position = UDim2.new(0, 0, 0, 30)
+    tabFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    tabFrame.BorderSizePixel = 0
+    tabFrame.Parent = main
+    
+    -- Content frame
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1, 0, 1, -70)
+    content.Position = UDim2.new(0, 0, 0, 70)
+    content.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    content.BorderSizePixel = 0
+    content.Parent = main
+    
+    -- Tab switching
+    local tabButtons = {}
+    local function switchTab(tabName)
+        for _, child in ipairs(content:GetChildren()) do
+            child.Visible = false
+        end
+        if tabs[tabName] then
+            tabs[tabName].Visible = true
+        end
+        for name, btn in pairs(tabButtons) do
+            btn.BackgroundColor3 = (name == tabName) and Color3.fromRGB(210, 210, 210) or Color3.fromRGB(80, 80, 80)
+            btn.TextColor3 = (name == tabName) and Color3.fromRGB(50, 50, 50) or Color3.fromRGB(240, 240, 240)
+        end
+    end
+    
+    -- Tab creation
+    function FallbackUI:CreateTab(name)
+        local tab = Instance.new("ScrollingFrame")
+        tab.Size = UDim2.new(1, -20, 1, -20)
+        tab.Position = UDim2.new(0, 10, 0, 10)
+        tab.BackgroundTransparency = 1
+        tab.BorderSizePixel = 0
+        tab.ScrollBarThickness = 8
+        tab.CanvasSize = UDim2.new(0, 0, 0, 0)
+        tab.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        tab.Parent = content
+        tab.Visible = false
+        tabs[name] = tab
+        
+        -- Tab button
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 80, 0, 30)
+        btn.Position = UDim2.new(0, (#tabButtons * 85), 0, 5)
+        btn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+        btn.Text = name
+        btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+        btn.Font = Enum.Font.SourceSans
+        btn.TextSize = 16
+        btn.BorderSizePixel = 1
+        btn.BorderColor3 = Color3.fromRGB(85, 85, 85)
+        btn.Parent = tabFrame
+        btn.MouseButton1Click:Connect(function() switchTab(name) end)
+        tabButtons[name] = btn
+        
+        if #tabButtons == 1 then switchTab(name) end
+        
+        local yPos = 0
+        
+        function tab:CreateSection(title)
+            local section = Instance.new("TextLabel")
+            section.Size = UDim2.new(1, 0, 0, 30)
+            section.Position = UDim2.new(0, 0, 0, yPos)
+            section.BackgroundTransparency = 1
+            section.Text = title
+            section.TextColor3 = Color3.fromRGB(240, 240, 240)
+            section.Font = Enum.Font.SourceSansBold
+            section.TextSize = 18
+            section.TextXAlignment = Enum.TextXAlignment.Left
+            section.Parent = tab
+            yPos = yPos + 35
+            return section
+        end
+        
+        function tab:CreateLabel(text)
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, 0, 0, 25)
+            label.Position = UDim2.new(0, 10, 0, yPos)
+            label.BackgroundTransparency = 1
+            label.Text = text
+            label.TextColor3 = Color3.fromRGB(200, 200, 200)
+            label.Font = Enum.Font.SourceSans
+            label.TextSize = 16
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.Parent = tab
+            yPos = yPos + 30
+            return { Set = function(_, newText) label.Text = newText end }
+        end
+        
+        function tab:CreateInput(data)
+            local bg = Instance.new("Frame")
+            bg.Size = UDim2.new(1, -20, 0, 35)
+            bg.Position = UDim2.new(0, 10, 0, yPos)
+            bg.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+            bg.BorderColor3 = Color3.fromRGB(65, 65, 65)
+            bg.BorderSizePixel = 1
+            bg.Parent = tab
+            
+            local box = Instance.new("TextBox")
+            box.Size = UDim2.new(1, -20, 1, -10)
+            box.Position = UDim2.new(0, 10, 0, 5)
+            box.BackgroundTransparency = 1
+            box.Text = ""
+            box.PlaceholderText = data.PlaceholderText or ""
+            box.PlaceholderColor3 = Color3.fromRGB(178, 178, 178)
+            box.TextColor3 = Color3.fromRGB(240, 240, 240)
+            box.Font = Enum.Font.SourceSans
+            box.TextSize = 16
+            box.ClearTextOnFocus = false
+            box.Parent = bg
+            
+            box.FocusLost:Connect(function()
+                if data.Callback then data.Callback(box.Text) end
+            end)
+            
+            yPos = yPos + 45
+            return { Set = function(_, newText) box.Text = newText end }
+        end
+        
+        function tab:CreateToggle(data)
+            local bg = Instance.new("TextButton")
+            bg.Size = UDim2.new(1, -20, 0, 35)
+            bg.Position = UDim2.new(0, 10, 0, yPos)
+            bg.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+            bg.Text = ""
+            bg.AutoButtonColor = false
+            bg.Parent = tab
+            
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, -60, 1, 0)
+            label.Position = UDim2.new(0, 10, 0, 0)
+            label.BackgroundTransparency = 1
+            label.Text = data.Name
+            label.TextColor3 = Color3.fromRGB(240, 240, 240)
+            label.Font = Enum.Font.SourceSans
+            label.TextSize = 16
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.Parent = bg
+            
+            local toggle = Instance.new("Frame")
+            toggle.Size = UDim2.new(0, 40, 0, 20)
+            toggle.Position = UDim2.new(1, -50, 0.5, -10)
+            toggle.BackgroundColor3 = data.CurrentValue and Color3.fromRGB(0, 146, 214) or Color3.fromRGB(100, 100, 100)
+            toggle.BorderColor3 = data.CurrentValue and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(125, 125, 125)
+            toggle.BorderSizePixel = 1
+            toggle.Parent = bg
+            
+            local circle = Instance.new("Frame")
+            circle.Size = UDim2.new(0, 16, 0, 16)
+            circle.Position = data.CurrentValue and UDim2.new(1, -21, 0.5, -8) or UDim2.new(0, 5, 0.5, -8)
+            circle.BackgroundColor3 = Color3.fromRGB(240, 240, 240)
+            circle.BorderSizePixel = 0
+            circle.Parent = toggle
+            
+            local state = data.CurrentValue
+            bg.MouseButton1Click:Connect(function()
+                state = not state
+                toggle.BackgroundColor3 = state and Color3.fromRGB(0, 146, 214) or Color3.fromRGB(100, 100, 100)
+                toggle.BorderColor3 = state and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(125, 125, 125)
+                circle.Position = state and UDim2.new(1, -21, 0.5, -8) or UDim2.new(0, 5, 0.5, -8)
+                if data.Callback then data.Callback(state) end
+            end)
+            
+            yPos = yPos + 45
+            return { Set = function(_, newState)
+                state = newState
+                toggle.BackgroundColor3 = state and Color3.fromRGB(0, 146, 214) or Color3.fromRGB(100, 100, 100)
+                toggle.BorderColor3 = state and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(125, 125, 125)
+                circle.Position = state and UDim2.new(1, -21, 0.5, -8) or UDim2.new(0, 5, 0.5, -8)
+            end }
+        end
+        
+        function tab:CreateSlider(data)
+            local bg = Instance.new("Frame")
+            bg.Size = UDim2.new(1, -20, 0, 50)
+            bg.Position = UDim2.new(0, 10, 0, yPos)
+            bg.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+            bg.BorderSizePixel = 0
+            bg.Parent = tab
+            
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, -20, 0, 20)
+            label.Position = UDim2.new(0, 10, 0, 5)
+            label.BackgroundTransparency = 1
+            label.Text = data.Name .. ": " .. data.CurrentValue .. data.Suffix
+            label.TextColor3 = Color3.fromRGB(240, 240, 240)
+            label.Font = Enum.Font.SourceSans
+            label.TextSize = 16
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.Parent = bg
+            
+            local slider = Instance.new("Frame")
+            slider.Size = UDim2.new(1, -20, 0, 6)
+            slider.Position = UDim2.new(0, 10, 0, 30)
+            slider.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+            slider.BorderSizePixel = 0
+            slider.Parent = bg
+            
+            local fill = Instance.new("Frame")
+            fill.Size = UDim2.new((data.CurrentValue - data.Range[1]) / (data.Range[2] - data.Range[1]), 0, 1, 0)
+            fill.BackgroundColor3 = Color3.fromRGB(50, 138, 220)
+            fill.BorderSizePixel = 0
+            fill.Parent = slider
+            
+            local button = Instance.new("TextButton")
+            button.Size = UDim2.new(0, 20, 0, 20)
+            button.Position = UDim2.new((data.CurrentValue - data.Range[1]) / (data.Range[2] - data.Range[1]), -10, 0, -7)
+            button.BackgroundColor3 = Color3.fromRGB(240, 240, 240)
+            button.BorderSizePixel = 0
+            button.Text = ""
+            button.Parent = slider
+            
+            local dragging = false
+            button.MouseButton1Down:Connect(function() dragging = true end)
+            game:GetService("UserInputService").InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+            end)
+            
+            game:GetService("RunService").RenderStepped:Connect(function()
+                if dragging then
+                    local mousePos = game:GetService("UserInputService"):GetMouseLocation()
+                    local absPos = slider.AbsolutePosition
+                    local size = slider.AbsoluteSize.X
+                    local percent = math.clamp((mousePos.X - absPos.X) / size, 0, 1)
+                    local value = data.Range[1] + (data.Range[2] - data.Range[1]) * percent
+                    value = math.floor(value / data.Increment + 0.5) * data.Increment
+                    percent = (value - data.Range[1]) / (data.Range[2] - data.Range[1])
+                    
+                    fill.Size = UDim2.new(percent, 0, 1, 0)
+                    button.Position = UDim2.new(percent, -10, 0, -7)
+                    label.Text = data.Name .. ": " .. value .. data.Suffix
+                    if data.Callback then data.Callback(value) end
+                end
+            end)
+            
+            yPos = yPos + 60
+            return { Set = function(_, newValue)
+                local percent = (newValue - data.Range[1]) / (data.Range[2] - data.Range[1])
+                fill.Size = UDim2.new(percent, 0, 1, 0)
+                button.Position = UDim2.new(percent, -10, 0, -7)
+                label.Text = data.Name .. ": " .. newValue .. data.Suffix
+            end }
+        end
+        
+        function tab:CreateButton(data)
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -20, 0, 35)
+            btn.Position = UDim2.new(0, 10, 0, yPos)
+            btn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+            btn.Text = data.Name
+            btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+            btn.Font = Enum.Font.SourceSans
+            btn.TextSize = 16
+            btn.BorderSizePixel = 0
+            btn.Parent = tab
+            btn.MouseButton1Click:Connect(data.Callback)
+            yPos = yPos + 45
+        end
+        
+        return tab
+    end
+    
+    function FallbackUI:Notify(data)
+        local notif = Instance.new("Frame")
+        notif.Size = UDim2.new(0, 300, 0, 80)
+        notif.Position = UDim2.new(1, -320, 1, -100)
+        notif.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+        notif.BorderSizePixel = 0
+        notif.Parent = gui
+        
+        local title = Instance.new("TextLabel")
+        title.Size = UDim2.new(1, -20, 0, 25)
+        title.Position = UDim2.new(0, 10, 0, 5)
+        title.BackgroundTransparency = 1
+        title.Text = data.Title
+        title.TextColor3 = Color3.fromRGB(240, 240, 240)
+        title.Font = Enum.Font.SourceSansBold
+        title.TextSize = 18
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = notif
+        
+        local content = Instance.new("TextLabel")
+        content.Size = UDim2.new(1, -20, 0, 40)
+        content.Position = UDim2.new(0, 10, 0, 30)
+        content.BackgroundTransparency = 1
+        content.Text = data.Content
+        content.TextColor3 = Color3.fromRGB(200, 200, 200)
+        content.Font = Enum.Font.SourceSans
+        content.TextSize = 14
+        content.TextXAlignment = Enum.TextXAlignment.Left
+        content.TextWrapped = true
+        content.Parent = notif
+        
+        task.delay(data.Duration or 5, function() notif:Destroy() end)
+    end
+    
+    return FallbackUI
+end
+
+-- Attempt to load Rayfield from multiple sources
+local function loadRayfield()
+    local urls = {
+        "https://sirius.menu/rayfield",
+        "https://raw.githubusercontent.com/RayfieldUI/Rayfield/main/source.lua",
+        "https://cdn.jsdelivr.net/gh/RayfieldUI/Rayfield@main/source.lua",
+        "https://gitlab.com/RayfieldUI/Rayfield/-/raw/main/source.lua"
+    }
+    
+    for i, url in ipairs(urls) do
+        for attempt = 1, 3 do
+            local success, result = pcall(function()
+                return game:HttpGet(url)
+            end)
+            
+            if success and type(result) == "string" and #result > 1000 then
+                local fn, err = loadstring(result)
+                if fn then
+                    local ok, rayfield = pcall(fn)
+                    if ok and rayfield then
+                        return rayfield
+                    else
+                        warn("Rayfield execution failed:", rayfield)
+                    end
+                else
+                    warn("Rayfield loadstring error:", err)
+                end
+            else
+                warn(string.format("Failed to fetch Rayfield from %s attempt %d", url, attempt))
+            end
+            task.wait(1)
+        end
+    end
+    
+    warn("All Rayfield sources failed. Using fallback UI.")
+    return createFallbackUI()
+end
+
+Rayfield = loadRayfield()
+
+-- Create window (will work with either Rayfield or fallback)
+Window = Rayfield:CreateWindow({
     Name = "Project Dark",
     Icon = 0,
     LoadingTitle = "Project Dark",
