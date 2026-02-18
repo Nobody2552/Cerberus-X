@@ -15,139 +15,115 @@
 wait(0.5)
 
 -- ============ EXECUTOR HTTP COMPATIBILITY ============
--- Roblox blocks HttpService:PostAsync/GetAsync/UrlEncode in executors.
--- All modern executors provide one of these global functions instead.
-local httpRequest = (syn and syn.request) 
-    or (http and http.request) 
-    or (fluxus and fluxus.request)
-    or request 
-    or http_request
+-- Different executors provide HTTP in different ways:
+--   Synapse X:      syn.request(...)
+--   KRNL/Fluxus:    request(...) or http_request(...)
+--   Xeno:           99% UNC -- provides request() global AND unblocks HttpService:RequestAsync
+--   Studio:         Native HttpService works directly
+--
+-- We build a unified httpRequest(params) that tries EVERY method on each call,
+-- so there is no fragile upfront detection that can silently fail.
 
-if not httpRequest then
-    -- Last-resort fallback: try to wrap HttpService (will fail in most executors)
-    local HttpService = game:GetService("HttpService")
-    httpRequest = function(params)
-        local method = params.Method or "GET"
-        local url = params.Url
-        local body = params.Body
-        local headers = params.Headers or {}
-        
-        local success, result
-        if method == "POST" then
-            success, result = pcall(function()
-                return HttpService:PostAsync(url, body, Enum.HttpContentType.ApplicationJson, false, headers)
-            end)
+local _HttpService = game:GetService("HttpService")
+
+-- Collect all possible request functions (pcall each to avoid "not defined" errors)
+local _methods = {}
+pcall(function() if syn and syn.request then table.insert(_methods, syn.request) end end)
+pcall(function() if http and http.request then table.insert(_methods, http.request) end end)
+pcall(function() if fluxus and fluxus.request then table.insert(_methods, fluxus.request) end end)
+pcall(function() if request then table.insert(_methods, request) end end)
+pcall(function() if http_request then table.insert(_methods, http_request) end end)
+
+-- Also add HttpService:RequestAsync as a method (Xeno unblocks this)
+table.insert(_methods, function(params)
+    return _HttpService:RequestAsync({
+        Url = params.Url,
+        Method = params.Method or "GET",
+        Headers = params.Headers or {},
+        Body = params.Body,
+    })
+end)
+
+-- Also add GetAsync/PostAsync wrappers as last resort
+table.insert(_methods, function(params)
+    local method = params.Method or "GET"
+    if method == "POST" then
+        local result = _HttpService:PostAsync(params.Url, params.Body or "", Enum.HttpContentType.ApplicationJson, false)
+        return { StatusCode = 200, Body = result, Success = true }
+    else
+        local result = _HttpService:GetAsync(params.Url)
+        return { StatusCode = 200, Body = result, Success = true }
+    end
+end)
+
+-- Also add game:HttpGet wrapper
+table.insert(_methods, function(params)
+    if (params.Method or "GET") == "GET" then
+        local result = game:HttpGet(params.Url)
+        return { StatusCode = 200, Body = result, Success = true }
+    end
+    -- game:HttpGet can't POST, fall through
+    error("game:HttpGet does not support POST")
+end)
+
+-- Unified request function: tries each method until one succeeds
+local function httpRequest(params)
+    local lastErr = "No HTTP methods available"
+    for _, fn in ipairs(_methods) do
+        local ok, resp = pcall(fn, params)
+        if ok and resp then
+            -- Normalize response: some return { Body = ... }, some { body = ... }
+            if type(resp) == "string" then
+                return { StatusCode = 200, Body = resp, Success = true }
+            end
+            if type(resp) == "table" then
+                resp.Body = resp.Body or resp.body or ""
+                resp.StatusCode = resp.StatusCode or resp.StatusCode or 200
+                resp.Success = (resp.Success ~= false)
+                return resp
+            end
         else
-            success, result = pcall(function()
-                return HttpService:GetAsync(url, true, headers)
-            end)
-        end
-        
-        if success then
-            return { StatusCode = 200, Body = result, Success = true }
-        else
-            return { StatusCode = 0, Body = tostring(result), Success = false }
+            lastErr = tostring(resp)
         end
     end
+    return { StatusCode = 0, Body = lastErr, Success = false }
 end
 
 -- ============ UI SETUP ============
--- Rayfield fetch uses a multi-strategy approach because:
---   game:HttpGet  -> blocked in most executors
---   httpRequest   -> field names vary (.Body vs .body), and sirius.menu may redirect
---   httpget       -> some executors provide this as a direct string-returning GET
--- We try every combination of method x URL until one returns valid Lua source.
+-- Rayfield fetch: httpRequest already tries every HTTP method (executor globals,
+-- RequestAsync, GetAsync, game:HttpGet) so we just need to try each URL.
 
 local _rayfieldSource = nil
 
--- Helper: extract body string from a response table (handles .Body / .body / raw string)
-local function _extractBody(resp)
-    if type(resp) == "string" then return resp end
-    if type(resp) ~= "table" then return nil end
-    return resp.Body or resp.body or nil
-end
-
--- Helper: check if source looks like valid Lua (not an HTML redirect page)
 local function _isLuaSource(src)
     if type(src) ~= "string" then return false end
     if #src < 200 then return false end
-    -- HTML pages start with < or contain <!DOCTYPE
     if src:sub(1, 1) == "<" then return false end
     if src:find("<!DOCTYPE", 1, true) then return false end
     return true
 end
 
--- Rayfield source URLs in priority order
 local _rayfieldUrls = {
     "https://sirius.menu/rayfield",
     "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
     "https://raw.githubusercontent.com/shlexware/Rayfield/main/source",
 }
 
--- Strategy 1: executor httpRequest (handles most executors)
-if not _rayfieldSource then
-    for _, url in ipairs(_rayfieldUrls) do
-        if _rayfieldSource then break end
-        pcall(function()
-            local resp = httpRequest({ Url = url, Method = "GET" })
-            local body = _extractBody(resp)
-            if _isLuaSource(body) then
-                _rayfieldSource = body
-            end
-        end)
-    end
-end
-
--- Strategy 2: httpget / http_get globals (Fluxus, KRNL, etc. provide a simple string-returning GET)
-if not _rayfieldSource then
-    local _httpget = httpget or http_get or nil
-    if _httpget then
-        for _, url in ipairs(_rayfieldUrls) do
-            if _rayfieldSource then break end
-            pcall(function()
-                local body = _httpget(url)
-                if _isLuaSource(body) then
-                    _rayfieldSource = body
-                end
-            end)
-        end
-    end
-end
-
--- Strategy 3: game:HttpGet (works in Studio and rare executors that don't block it)
-if not _rayfieldSource then
-    for _, url in ipairs(_rayfieldUrls) do
-        if _rayfieldSource then break end
-        pcall(function()
-            local body = game:HttpGet(url, true)
-            if _isLuaSource(body) then
-                _rayfieldSource = body
-            end
-        end)
-    end
-end
-
--- Strategy 4: HttpService:GetAsync as absolute last resort
-if not _rayfieldSource then
+for _, url in ipairs(_rayfieldUrls) do
+    if _rayfieldSource then break end
     pcall(function()
-        local hs = game:GetService("HttpService")
-        for _, url in ipairs(_rayfieldUrls) do
-            if _rayfieldSource then break end
-            pcall(function()
-                local body = hs:GetAsync(url)
-                if _isLuaSource(body) then
-                    _rayfieldSource = body
-                end
-            end)
+        local resp = httpRequest({ Url = url, Method = "GET" })
+        local body = (type(resp) == "table") and (resp.Body or resp.body) or (type(resp) == "string" and resp) or nil
+        if _isLuaSource(body) then
+            _rayfieldSource = body
         end
     end)
 end
 
 if not _rayfieldSource then
-    -- All strategies failed, give a detailed error
     local exName = "Unknown"
     pcall(function() exName = identifyexecutor and identifyexecutor() or (getexecutorname and getexecutorname()) or "Unknown" end)
-    error("[Project Dark] Could not fetch Rayfield. Executor: " .. tostring(exName) .. ". Enable HTTP requests in your executor settings.")
+    error("[Project Dark] Could not fetch Rayfield. Executor: " .. tostring(exName) .. ". Ensure HTTP is enabled.")
 end
 
 local Rayfield = loadstring(_rayfieldSource)()
@@ -183,12 +159,12 @@ pcall(function()
 end)
 
 -- ============ AUTO RE-EXECUTE ON SERVER HOP ============
--- Executors provide queue_on_teleport (or syn.queue_on_teleport) which queues
--- a script string to execute automatically when the player arrives in the new server.
-local _queueOnTeleport = (syn and syn.queue_on_teleport)
-    or queue_on_teleport
-    or (fluxus and fluxus.queue_on_teleport)
-    or nil
+-- Executors provide queue_on_teleport which queues a script to run after teleport.
+-- Each executor may expose it differently, so we pcall each check.
+local _queueOnTeleport = nil
+pcall(function() if syn and syn.queue_on_teleport then _queueOnTeleport = syn.queue_on_teleport end end)
+if not _queueOnTeleport then pcall(function() if queue_on_teleport then _queueOnTeleport = queue_on_teleport end end) end
+if not _queueOnTeleport then pcall(function() if fluxus and fluxus.queue_on_teleport then _queueOnTeleport = fluxus.queue_on_teleport end end) end
 
 -- IMPORTANT: Replace this URL with your actual raw GitHub script URL
 local SCRIPT_REEXEC_URL = "https://raw.githubusercontent.com/Nobody2552/Project-Dark/main/Auto_Main.lua"
@@ -244,32 +220,39 @@ local function queueAutoReexecute()
         -- Fetch script source using every available HTTP method
         local __src = nil
         local __url = %q
-        -- 1. Executor request() table-based HTTP
-        local __httpReq = (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request) or request or http_request or nil
-        if __httpReq and not __src then
-            pcall(function()
-                local __resp = __httpReq({ Url = __url, Method = "GET" })
-                local __body = (type(__resp) == "table") and (__resp.Body or __resp.body) or nil
-                if type(__body) == "string" and #__body > 200 and __body:sub(1,1) ~= "<" then
-                    __src = __body
-                end
-            end)
+        local function __ok(s) return type(s)=="string" and #s>200 and s:sub(1,1)~="<" end
+        local function __body(r)
+            if type(r)=="string" then return r end
+            if type(r)=="table" then return r.Body or r.body end
+            return nil
         end
-        -- 2. httpget / http_get string-returning GET
-        if not __src then
-            local __hg = httpget or http_get or nil
-            if __hg then pcall(function()
-                local __body = __hg(__url)
-                if type(__body) == "string" and #__body > 200 and __body:sub(1,1) ~= "<" then __src = __body end
-            end) end
-        end
-        -- 3. game:HttpGet fallback
-        if not __src then
-            pcall(function()
-                local __body = game:HttpGet(__url, true)
-                if type(__body) == "string" and #__body > 200 and __body:sub(1,1) ~= "<" then __src = __body end
-            end)
-        end
+        -- 1. Executor globals (Synapse, KRNL, Fluxus, Script-Ware)
+        local __req=nil
+        pcall(function() if syn and syn.request then __req=syn.request end end)
+        if not __req then pcall(function() if request then __req=request end end) end
+        if not __req then pcall(function() if http_request then __req=http_request end end) end
+        if __req then pcall(function()
+            local r=__req({Url=__url,Method="GET"})
+            local b=__body(r)
+            if __ok(b) then __src=b end
+        end) end
+        -- 2. HttpService:RequestAsync (Xeno)
+        if not __src then pcall(function()
+            local hs=game:GetService("HttpService")
+            local r=hs:RequestAsync({Url=__url,Method="GET"})
+            local b=__body(r)
+            if __ok(b) then __src=b end
+        end) end
+        -- 3. game:HttpGet (Xeno also unblocks this)
+        if not __src then pcall(function()
+            local b=game:HttpGet(__url)
+            if __ok(b) then __src=b end
+        end) end
+        -- 4. httpget global
+        if not __src then pcall(function()
+            local b=(httpget or http_get)(__url)
+            if __ok(b) then __src=b end
+        end) end
         if __src then
             loadstring(__src)()
         else
