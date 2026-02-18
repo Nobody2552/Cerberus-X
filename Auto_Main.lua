@@ -52,32 +52,104 @@ if not httpRequest then
 end
 
 -- ============ UI SETUP ============
--- game:HttpGet is BLOCKED in executors, so use our executor-compatible httpRequest
-local _rayfieldSource
-local _rfOk, _rfErr = pcall(function()
-    -- Try executor HTTP first (works in all modern executors)
-    local resp = httpRequest({
-        Url = "https://sirius.menu/rayfield",
-        Method = "GET",
-    })
-    if resp and resp.Body and #resp.Body > 100 then
-        _rayfieldSource = resp.Body
+-- Rayfield fetch uses a multi-strategy approach because:
+--   game:HttpGet  -> blocked in most executors
+--   httpRequest   -> field names vary (.Body vs .body), and sirius.menu may redirect
+--   httpget       -> some executors provide this as a direct string-returning GET
+-- We try every combination of method x URL until one returns valid Lua source.
+
+local _rayfieldSource = nil
+
+-- Helper: extract body string from a response table (handles .Body / .body / raw string)
+local function _extractBody(resp)
+    if type(resp) == "string" then return resp end
+    if type(resp) ~= "table" then return nil end
+    return resp.Body or resp.body or nil
+end
+
+-- Helper: check if source looks like valid Lua (not an HTML redirect page)
+local function _isLuaSource(src)
+    if type(src) ~= "string" then return false end
+    if #src < 200 then return false end
+    -- HTML pages start with < or contain <!DOCTYPE
+    if src:sub(1, 1) == "<" then return false end
+    if src:find("<!DOCTYPE", 1, true) then return false end
+    return true
+end
+
+-- Rayfield source URLs in priority order
+local _rayfieldUrls = {
+    "https://sirius.menu/rayfield",
+    "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
+    "https://raw.githubusercontent.com/shlexware/Rayfield/main/source",
+}
+
+-- Strategy 1: executor httpRequest (handles most executors)
+if not _rayfieldSource then
+    for _, url in ipairs(_rayfieldUrls) do
+        if _rayfieldSource then break end
+        pcall(function()
+            local resp = httpRequest({ Url = url, Method = "GET" })
+            local body = _extractBody(resp)
+            if _isLuaSource(body) then
+                _rayfieldSource = body
+            end
+        end)
     end
-end)
--- Fallback chain if executor request failed
+end
+
+-- Strategy 2: httpget / http_get globals (Fluxus, KRNL, etc. provide a simple string-returning GET)
+if not _rayfieldSource then
+    local _httpget = httpget or http_get or nil
+    if _httpget then
+        for _, url in ipairs(_rayfieldUrls) do
+            if _rayfieldSource then break end
+            pcall(function()
+                local body = _httpget(url)
+                if _isLuaSource(body) then
+                    _rayfieldSource = body
+                end
+            end)
+        end
+    end
+end
+
+-- Strategy 3: game:HttpGet (works in Studio and rare executors that don't block it)
+if not _rayfieldSource then
+    for _, url in ipairs(_rayfieldUrls) do
+        if _rayfieldSource then break end
+        pcall(function()
+            local body = game:HttpGet(url, true)
+            if _isLuaSource(body) then
+                _rayfieldSource = body
+            end
+        end)
+    end
+end
+
+-- Strategy 4: HttpService:GetAsync as absolute last resort
 if not _rayfieldSource then
     pcall(function()
-        _rayfieldSource = game:HttpGet("https://sirius.menu/rayfield")
+        local hs = game:GetService("HttpService")
+        for _, url in ipairs(_rayfieldUrls) do
+            if _rayfieldSource then break end
+            pcall(function()
+                local body = hs:GetAsync(url)
+                if _isLuaSource(body) then
+                    _rayfieldSource = body
+                end
+            end)
+        end
     end)
 end
+
 if not _rayfieldSource then
-    pcall(function()
-        _rayfieldSource = game:HttpGet("https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua")
-    end)
+    -- All strategies failed, give a detailed error
+    local exName = "Unknown"
+    pcall(function() exName = identifyexecutor and identifyexecutor() or (getexecutorname and getexecutorname()) or "Unknown" end)
+    error("[Project Dark] Could not fetch Rayfield. Executor: " .. tostring(exName) .. ". Enable HTTP requests in your executor settings.")
 end
-if not _rayfieldSource or type(_rayfieldSource) ~= "string" or #_rayfieldSource < 100 then
-    error("[Project Dark] Failed to fetch Rayfield UI library. Check your executor's HTTP permissions.")
-end
+
 local Rayfield = loadstring(_rayfieldSource)()
 local Window = Rayfield:CreateWindow({
     Name = "Project Dark",
@@ -169,26 +241,39 @@ local function queueAutoReexecute()
         _G.__ProjectDark_ScriptURL = %q
         task.wait(2)
 
-        -- Fetch script source using executor HTTP (game:HttpGet is blocked)
+        -- Fetch script source using every available HTTP method
         local __src = nil
         local __url = %q
+        -- 1. Executor request() table-based HTTP
         local __httpReq = (syn and syn.request) or (http and http.request) or (fluxus and fluxus.request) or request or http_request or nil
-        if __httpReq then
-            local __ok, __resp = pcall(function()
-                return __httpReq({ Url = __url, Method = "GET" })
+        if __httpReq and not __src then
+            pcall(function()
+                local __resp = __httpReq({ Url = __url, Method = "GET" })
+                local __body = (type(__resp) == "table") and (__resp.Body or __resp.body) or nil
+                if type(__body) == "string" and #__body > 200 and __body:sub(1,1) ~= "<" then
+                    __src = __body
+                end
             end)
-            if __ok and __resp and __resp.Body and #__resp.Body > 100 then
-                __src = __resp.Body
-            end
         end
-        -- Fallback to game:HttpGet (works in some executors / studio)
+        -- 2. httpget / http_get string-returning GET
         if not __src then
-            pcall(function() __src = game:HttpGet(__url) end)
+            local __hg = httpget or http_get or nil
+            if __hg then pcall(function()
+                local __body = __hg(__url)
+                if type(__body) == "string" and #__body > 200 and __body:sub(1,1) ~= "<" then __src = __body end
+            end) end
         end
-        if __src and type(__src) == "string" and #__src > 100 then
+        -- 3. game:HttpGet fallback
+        if not __src then
+            pcall(function()
+                local __body = game:HttpGet(__url, true)
+                if type(__body) == "string" and #__body > 200 and __body:sub(1,1) ~= "<" then __src = __body end
+            end)
+        end
+        if __src then
             loadstring(__src)()
         else
-            warn("[Project Dark] Failed to re-fetch script after server hop")
+            warn("[Project Dark] Failed to re-fetch script after server hop. URL: " .. __url)
         end
     ]],
         authToken or "",
